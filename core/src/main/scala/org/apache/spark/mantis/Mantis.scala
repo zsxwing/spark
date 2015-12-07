@@ -3,10 +3,15 @@ package org.apache.spark.mantis
 import java.io.Serializable
 import java.net.Socket
 import java.nio.ByteBuffer
+import java.util.Date
+import java.util.concurrent.atomic.AtomicInteger
+
+
+import scala.reflect.{classTag, ClassTag}
 
 import org.apache.spark.rpc._
 import org.apache.spark.util.RpcUtils
-import org.apache.spark.{SparkEnv, SparkContext, SparkConf}
+import org.apache.spark._
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.serializer.JavaSerializer
 import rx.lang.scala.subjects.{ReplaySubject, PublishSubject}
@@ -20,25 +25,27 @@ import rx.lang.scala.{Subscription, Observable}
 import rx.lang.scala._
 import rx.lang.scala.JavaConversions._
 
-import io.reactivex.netty.RxNetty
-import io.reactivex.netty.channel.ConnectionHandler
-import io.reactivex.netty.channel.ObservableConnection
-import io.reactivex.netty.pipeline.PipelineConfigurators
-import io.reactivex.netty.server.RxServer
+import _root_.io.reactivex.netty.RxNetty
+import _root_.io.reactivex.netty.channel.ConnectionHandler
+import _root_.io.reactivex.netty.channel.ObservableConnection
+import _root_.io.reactivex.netty.pipeline.PipelineConfigurators
+import _root_.io.reactivex.netty.server.RxServer
 import scala.language.implicitConversions
 
 import scala.concurrent.duration._
 
 trait MantisJob[T] extends Serializable {
 
+  val id: Int = MantisJob.nextId
+
   protected val engine: ExecutionEngine
 
-  def forkJoin[I: ClassTag, R: ClassTag](
-    fork: Observable[T] => Observable[Observable[I]])(
-    join: Observable[Observable[I]] => Observable[Observable[R]],
-    cores: Int = 1): MantisStage[T, I, R] = {
-    new MantisStage(engine, cores, this)(fork)(join)
-  }
+//  def forkJoin[I: ClassTag, R: ClassTag](
+//    fork: Observable[T] => Observable[Observable[I]])(
+//    join: Observable[Observable[I]] => Observable[Observable[R]],
+//    cores: Int = 1): MantisStage[T, I, R] = {
+//    new MantisStage(engine, cores, this)(fork)(join)
+//  }
 
 
 
@@ -53,7 +60,7 @@ trait MantisJob[T] extends Serializable {
 
   // ->
 
-  // 1234 
+  // 1234
 
 
   // O[T] => O[O[R]] ,  O[O[R]] =>
@@ -63,13 +70,20 @@ trait MantisJob[T] extends Serializable {
   // O[R]
   // G =>
 
-  def stage[R: ClassTag](
-    fork: Observable[T] => Observable[Observable[R]],
-    cores: Int = 1): MantisStage[T, R, R] = {
-    new MantisStage[T, R, R](engine, cores, this)(fork)(o => o)
+  def stage[R: ClassTag](f: Observable[T] => Observable[R], partitioner: Partitioner): MantisStage[T, R] = {
+    new MantisStage(engine, this, partitioner, f)
   }
 
-//  def transform[R: ClassTag](stage: Observable[T] => Observable[R], cores: Int = 1): MantisStage[T, R] = {
+  def stage[R: ClassTag](f: Observable[T] => Observable[R], numPartitions: Int): MantisStage[T, R] = {
+    stage(f, new HashPartitioner(numPartitions))
+  }
+
+  def stage[R: ClassTag](f: Observable[T] => Observable[R]): MantisStage[T, R] = {
+    stage(f, 2)
+  }
+
+
+  //  def transform[R: ClassTag](stage: Observable[T] => Observable[R], cores: Int = 1): MantisStage[T, R] = {
 //    new MantisStage(engine, cores, this)(o => Observable.just(stage(o)))
 //  }
 
@@ -81,20 +95,23 @@ class MantisSource[T](val engine: ExecutionEngine, source: () => Observable[T]) 
   override def sink(sink: () => Observer[T]): Unit = source().subscribe(sink())
 }
 
-class MantisStage[T, I: ClassTag, R: ClassTag](
+class MantisStage[T, R: ClassTag](
   val engine: ExecutionEngine,
-  cores: Int,
-  parent: MantisJob[T])(
-  fork: Observable[T] => Observable[Observable[I]])(
-  join: Observable[Observable[I]] => Observable[Observable[R]]) extends MantisJob[R] {
+  parent: MantisJob[T],
+  partitioner: Partitioner,
+  f: Observable[T] => Observable[R]) extends MantisJob[R] {
 
   override def sink(sink: () => Observer[R]): Unit = {
-    parent.sink(engine.exchange(cores, fork, join, sink))
+    parent.sink(engine.exchange(id, partitioner, f, sink))
   }
 
 }
 
 object MantisJob {
+
+  private val idGenerator = new AtomicInteger(0)
+
+  def nextId: Int = idGenerator.getAndIncrement()
 
   //val engine = new LocalExecutionEngine
   private val engine = new ClusterExecutionEngine
@@ -108,7 +125,7 @@ object Sinks {
 
   def print[T]: () => Observer[T] = { () =>
     new Observer[T] {
-      override def onNext(value: T): Unit = println(value)
+      override def onNext(value: T): Unit = println("Thread: " +Thread.currentThread() + " " +  value)
 
       override def onError(error: Throwable): Unit = error.printStackTrace()
 
@@ -151,7 +168,7 @@ object Sources {
   }
 }
 
-class ExchangeSink[T: ClassTag](host: String, port: Int, subscription: Subscription, streamId: Int) extends (Observable[T] => Unit) {
+class ExchangeSink[T: ClassTag](host: String, port: Int, subscription: Subscription) extends (Observable[T] => Unit) {
 
   private val serializer = new JavaSerializer(new SparkConf()).newInstance()
 
@@ -165,7 +182,7 @@ class ExchangeSink[T: ClassTag](host: String, port: Int, subscription: Subscript
           subscription.unsubscribe()
         }.subscribe(v => {
           println("ExchangeSink: " + v)
-          connection.writeAndFlush(JavaUtils.bufferToArray(serializer.serialize((streamId, v)))): Unit
+          connection.writeAndFlush(JavaUtils.bufferToArray(serializer.serialize(v))): Unit
         }, e => e.printStackTrace())
       },
       e => e.printStackTrace(),
@@ -174,9 +191,9 @@ class ExchangeSink[T: ClassTag](host: String, port: Int, subscription: Subscript
   }
 }
 
-class ExchangeSource[T: ClassTag] extends (() => Observable[Observable[T]]) {
+class ExchangeSource[T: ClassTag](val partitionId: Int) extends (() => Observable[T]) {
 
-  private val subject = ReplaySubject[Observable[T]]().toSerialized
+  private val subject = ReplaySubject[T]().toSerialized
 
   private val serializer = new JavaSerializer(new SparkConf()).newInstance()
 
@@ -185,10 +202,10 @@ class ExchangeSource[T: ClassTag] extends (() => Observable[Observable[T]]) {
       new ConnectionHandler[Array[Byte], Array[Byte]]() {
         override def handle(newConnection: ObservableConnection[Array[Byte], Array[Byte]]): rx.Observable[Void] = {
           toJavaObservable(toScalaObservable(newConnection.getInput).map { (bytes: Array[Byte]) =>
-            val v = serializer.deserialize[(Int, T)](ByteBuffer.wrap(bytes))
+            val v = serializer.deserialize[T](ByteBuffer.wrap(bytes))
             println("Receive: " + v)
             v
-          }.groupBy(_._1, _._2).map(_._2).doOnEach(
+          }.doOnEach(
               v => subject.onNext(v),
               e => subject.onError(e),
               () => subject.onCompleted()
@@ -197,9 +214,13 @@ class ExchangeSource[T: ClassTag] extends (() => Observable[Observable[T]]) {
       })
   }
 
-  override def apply(): Observable[Observable[T]] = subject.map(_.publish(o => o))
+  override def apply(): Observable[T] = subject
 
   private val server = createServer().start()
+
+  def await(): Unit = {
+    server.waitTillShutdown()
+  }
 
   val port = server.getServerPort
 }
@@ -209,10 +230,10 @@ trait ExecutionEngine extends Serializable {
 
   def defaultParallelism: Int
 
-  def exchange[T, I: ClassTag, R: ClassTag](
-    cores: Int,
-    fork: Observable[T] => Observable[Observable[I]],
-    join: Observable[Observable[I]] => Observable[Observable[R]],
+  def exchange[T, R: ClassTag](
+    id: Int,
+    partitioner: Partitioner,
+    f: Observable[T] => Observable[R],
     sink: () => Observer[R]): () => Observer[T]
 }
 
@@ -228,13 +249,13 @@ trait ExecutionEngine extends Serializable {
 //
 //}
 
-object RegisterNewSink
+case class RegisterSink(id: Int)
 
-case class LaunchExchangeSource[T, R](sinkId: Int, join: Observable[Observable[T]] => Observable[Observable[R]], sink: () => Observer[R])
+case class LaunchExchangeSource[T](sinkId: Int, cores: Int, sink: () => Observer[T])
 
 case class ShutdownExchangeSource[T](sinkId: Int)
 
-case class SinkAddress(sinkId: Int, host: String, port: Int)
+case class SinkAddress(sinkId: Int, partitionId: Int, host: String, port: Int)
 
 case class SinkCallback(sinkId: Int, callback: ((String, Int) => Unit))
 
@@ -253,60 +274,79 @@ class ClusterExecutionEngine extends ExecutionEngine {
 
     override val rpcEnv: RpcEnv = sparkContext.env.rpcEnv
 
-    private val sinkIdToObservable = new mutable.HashMap[Int, RpcCallContext]()
-    private val sinkIdToExchangeSource =  new mutable.HashMap[Int, RpcCallContext]()
+    private val sinkIdToObservable = new mutable.HashMap[Int, (Int, mutable.ArrayBuffer[RpcCallContext])]()
+    private val sinkIdToExchangeSource =  new mutable.HashMap[Int, mutable.HashMap[Int, (String, Int)]]()
 
-    private var nextSinkId = 0
+    override def receive: PartialFunction[Any, Unit] = {
+      case d@SinkAddress(id, partitionId, host, port) =>
+        sinkIdToExchangeSource(id)(partitionId) = (host, port)
+        if (sinkIdToExchangeSource(id).size == sinkIdToObservable(id)._1) {
+          val m = sinkIdToExchangeSource(id).toMap
+          for (c <- sinkIdToObservable(id)._2) {
+            c.reply(m)
+          }
+          sinkIdToObservable(id)._2.clear()
+        }
+    }
 
     override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-      case RegisterNewSink =>
-        nextSinkId += 1
-        context.reply(nextSinkId)
-      case LaunchExchangeSource(sinkId, join, sink) =>
-        sinkIdToObservable(sinkId) = context
-        val rdd = sparkContext.makeRDD(Seq(0), 1)
-        rdd.foreachAsync { _ =>
-          val coordinatorRef = RpcUtils.makeDriverRef(COORDINATOR_ENDPOINT_NAME, SparkEnv.get.conf, SparkEnv.get.rpcEnv)
-          val exchangeSource = new ExchangeSource
-          join(exchangeSource()).subscribe(
-            o => o.subscribe(sink().asInstanceOf[Observer[Any]]),
-            e => e.printStackTrace,
-            () => Unit // TODO
-          )
-          coordinatorRef.askWithRetry[Boolean](
-            SinkAddress(sinkId, SparkEnv.get.conf.get("spark.driver.host", "localhost"), exchangeSource.port)
-          )
+      case LaunchExchangeSource(id, numPartitions, sink) =>
+        if (sinkIdToObservable.contains(id)) {
+          if (sinkIdToExchangeSource(id).size == sinkIdToObservable(id)._1) {
+            val m = sinkIdToExchangeSource(id).toMap
+            for (c <- sinkIdToObservable(id)._2) {
+              c.reply(m)
+            }
+            sinkIdToObservable(id)._2.clear()
+            context.reply(m)
+          } else {
+            sinkIdToObservable(id)._2 += context
+          }
+        } else {
+          sinkIdToObservable(id) = (numPartitions, mutable.ArrayBuffer(context))
+          sinkIdToExchangeSource(id) = mutable.HashMap.empty
+          var i = 0
+          println("starting " + numPartitions)
+          while (i < numPartitions) {
+            val rdd = sparkContext.makeRDD(Seq(i), 1)
+            rdd.foreachAsync { partitionId =>
+              val coordinatorRef = RpcUtils.makeDriverRef(COORDINATOR_ENDPOINT_NAME, SparkEnv.get.conf, SparkEnv.get.rpcEnv)
+              val exchangeSource = new ExchangeSource(partitionId)
+              exchangeSource().subscribe(sink())
+              coordinatorRef.send(
+                SinkAddress(id, partitionId, SparkEnv.get.conf.get("spark.driver.host", "localhost"), exchangeSource.port)
+              )
+              exchangeSource.await()
+            }
+            i += 1
+          }
         }
-      case d@SinkAddress(sinkId, host, port) =>
-        sinkIdToObservable.remove(sinkId).foreach(_.reply(host, port))
-        sinkIdToExchangeSource(sinkId) = context
       case ShutdownExchangeSource(sinkId) =>
-        sinkIdToExchangeSource.remove(sinkId).foreach(_.reply(true))
+      // TODO
     }
   })
 
-  def exchange[T, I: ClassTag, R: ClassTag](
-    cores: Int,
-    fork: Observable[T] => Observable[Observable[I]],
-    join: Observable[Observable[I]] => Observable[Observable[R]],
+  override def exchange[T, R: ClassTag](id: Int,
+    partitioner: Partitioner,
+    f: Observable[T] => Observable[R],
     sink: () => Observer[R]): () => Observer[T] = { () =>
     val p = ReplaySubject[T].toSerialized
-    fork(p).zip((0 until cores).toObservable.repeat).groupBy(_._2, _._1).subscribe(oor => {
-      val coordinatorRef = RpcUtils.makeDriverRef(COORDINATOR_ENDPOINT_NAME, SparkEnv.get.conf, SparkEnv.get.rpcEnv)
-      val sinkId = coordinatorRef.askWithRetry[Int](RegisterNewSink)
-      val (host, port) = coordinatorRef.askWithRetry[(String, Int)](LaunchExchangeSource(sinkId, join, sink))
-      oor._2.subscribe(
-        or => {
-          val exchangeSink = new ExchangeSink[I](host, port, Subscription {
-            println("UnsubscribE!!!!!!!!")
-            //coordinatorRef.send(ShutdownExchangeSource(sinkId))
-          }, oor._1)
-          exchangeSink(or)
-        },
-        e => e.printStackTrace(),
-        () => Unit // TODO
-      )
-    }, e => e.printStackTrace(), () => Unit)
+
+    val coordinatorRef = RpcUtils.makeDriverRef(COORDINATOR_ENDPOINT_NAME, SparkEnv.get.conf, SparkEnv.get.rpcEnv)
+    val hostPosts = coordinatorRef.askWithRetry[Map[Int, (String, Int)]](LaunchExchangeSource(id, partitioner.numPartitions, sink))
+
+    f(p).groupBy(partitioner.getPartition).subscribe(
+    { case (partitionId, group) =>
+      val (host, port) = hostPosts(partitionId)
+      val exchangeSink = new ExchangeSink[R](host, port, Subscription {
+        println("Unsubscribe!!!!!!!!")
+        //coordinatorRef.send(ShutdownExchangeSource(sinkId))
+      })
+      exchangeSink(group)
+    },
+    e => e.printStackTrace(),
+    () => Unit // TODO
+    )
     p
   }
 }
@@ -323,19 +363,32 @@ object Demo {
 
   def apply(): Unit = {
     MantisJob.source(Sources.socketTextSource("localhost", 9999)).
-      forkJoin(
-        lines =>
+      stage(
+        (lines: Observable[String]) => {
           lines.flatMap { line =>
-            Observable.from(line.split(" ")).map(word => (word, 1))
-          }.groupBy(_._1, _._2))(
-        wordCounts => {
-          wordCounts.map { wordCount =>
-            wordCount.map(_._2).tumbling(10.seconds).flatMap { window =>
-              window.scan(0)(_ + _)
+            Observable.from(line.split(" "))
+          }
+        }, 3).
+      stage(
+        (lines: Observable[String]) => {
+          lines.groupBy(word => word, _ => 1).flatMap { case (word, counts) =>
+            counts.tumbling(10.seconds).flatMap { window =>
+              window.sum.timestamp.map { case (time, countInWindow) =>
+                (word, new Date(time), countInWindow)
+              }
             }
           }
-        }
-      ).sink(Sinks.print)
+        }, 2).
+      sink(Sinks.print)
+
+
+    //    wordCounts => {
+    //      wordCounts.map { wordCount =>
+    //        wordCount.map(_._2).tumbling(10.seconds).flatMap { window =>
+//          window.scan(0)(_ + _)
+//        }
+//      }
+//    }
 
     Thread.sleep(1000)
   }
