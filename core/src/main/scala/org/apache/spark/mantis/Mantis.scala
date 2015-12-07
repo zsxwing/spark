@@ -6,9 +6,6 @@ import java.nio.ByteBuffer
 import java.util.Date
 import java.util.concurrent.atomic.AtomicInteger
 
-
-import scala.reflect.{classTag, ClassTag}
-
 import org.apache.spark.rpc._
 import org.apache.spark.util.RpcUtils
 import org.apache.spark._
@@ -40,7 +37,6 @@ trait MantisJob[T] extends Serializable {
 
   protected val engine: ExecutionEngine
 
-
   def stage[R: ClassTag](f: Observable[T] => Observable[R], partitioner: Partitioner): MantisStage[T, R] = {
     new MantisStage(engine, this, partitioner, f)
   }
@@ -52,11 +48,6 @@ trait MantisJob[T] extends Serializable {
   def stage[R: ClassTag](f: Observable[T] => Observable[R]): MantisStage[T, R] = {
     stage(f, 2)
   }
-
-
-  //  def transform[R: ClassTag](stage: Observable[T] => Observable[R], cores: Int = 1): MantisStage[T, R] = {
-//    new MantisStage(engine, cores, this)(o => Observable.just(stage(o)))
-//  }
 
   def sink(sink: () => Observer[T]): Unit
 }
@@ -206,18 +197,6 @@ trait ExecutionEngine extends Serializable {
     sink: () => Observer[R]): () => Observer[T]
 }
 
-//class LocalExecutionEngine extends ExecutionEngine {
-//
-//  val defaultParallelism: Int = 1
-//
-//  override def exchange[T, R: ClassTag](cores: Int, stage: Observable[T] => Observable[Observable[R]], sink: () => Observer[Observable[R]]): () => Observer[T] = { () =>
-//    val p = PublishSubject[T]()
-//    stage(p).subscribe(sink())
-//    p
-//  }
-//
-//}
-
 case class RegisterSink(id: Int)
 
 case class LaunchExchangeSource[T](sinkId: Int, cores: Int, sink: () => Observer[T])
@@ -336,7 +315,7 @@ object Demo {
         }, 3).
       stage((lines: Observable[String]) => {
           lines.groupBy(word => word, _ => 1).flatMap { case (word, counts) =>
-            counts.tumbling(10.seconds).flatMap { window =>
+            counts.tumbling(5.seconds).flatMap { window =>
               window.sum.timestamp.map { case (time, countInWindow) =>
                 (word, new Date(time), countInWindow)
               }
