@@ -40,35 +40,6 @@ trait MantisJob[T] extends Serializable {
 
   protected val engine: ExecutionEngine
 
-//  def forkJoin[I: ClassTag, R: ClassTag](
-//    fork: Observable[T] => Observable[Observable[I]])(
-//    join: Observable[Observable[I]] => Observable[Observable[R]],
-//    cores: Int = 1): MantisStage[T, I, R] = {
-//    new MantisStage(engine, cores, this)(fork)(join)
-//  }
-
-
-
-  // O[T] => O[R],   O[R]
-  //                 O[R]
-   //                O[R]
-
-  // O[T] => O[G] => O[G]
-
-
-  // -> O[word, G] ----  O[word, G]
-
-  // ->
-
-  // 1234
-
-
-  // O[T] => O[O[R]] ,  O[O[R]] =>
-  // 1 2 3 4 =>  1 2 x
-  //             3 4 x
-  //             5 6 x
-  // O[R]
-  // G =>
 
   def stage[R: ClassTag](f: Observable[T] => Observable[R], partitioner: Partitioner): MantisStage[T, R] = {
     new MantisStage(engine, this, partitioner, f)
@@ -125,7 +96,7 @@ object Sinks {
 
   def print[T]: () => Observer[T] = { () =>
     new Observer[T] {
-      override def onNext(value: T): Unit = println("Thread: " +Thread.currentThread() + " " +  value)
+      override def onNext(value: T): Unit = println(value)
 
       override def onError(error: Throwable): Unit = error.printStackTrace()
 
@@ -145,7 +116,6 @@ object Sources {
           println("Connected to " + host + ":" + port)
           while (!subscriber.isUnsubscribed && iter.hasNext) {
             val v = iter.next()
-            println("Emit: " + v)
             subscriber.onNext(v)
           }
           if (!subscriber.isUnsubscribed) {
@@ -181,7 +151,6 @@ class ExchangeSink[T: ClassTag](host: String, port: Int, subscription: Subscript
         o.doOnUnsubscribe {
           subscription.unsubscribe()
         }.subscribe(v => {
-          println("ExchangeSink: " + v)
           connection.writeAndFlush(JavaUtils.bufferToArray(serializer.serialize(v))): Unit
         }, e => e.printStackTrace())
       },
@@ -202,11 +171,11 @@ class ExchangeSource[T: ClassTag](val partitionId: Int) extends (() => Observabl
       new ConnectionHandler[Array[Byte], Array[Byte]]() {
         override def handle(newConnection: ObservableConnection[Array[Byte], Array[Byte]]): rx.Observable[Void] = {
           toJavaObservable(toScalaObservable(newConnection.getInput).map { (bytes: Array[Byte]) =>
-            val v = serializer.deserialize[T](ByteBuffer.wrap(bytes))
-            println("Receive: " + v)
-            v
+            serializer.deserialize[T](ByteBuffer.wrap(bytes))
           }.doOnEach(
-              v => subject.onNext(v),
+              v => {
+                subject.onNext(v)
+              },
               e => subject.onError(e),
               () => subject.onCompleted()
             ).map(_ => null: Void)).asInstanceOf[rx.Observable[Void]]
@@ -306,7 +275,6 @@ class ClusterExecutionEngine extends ExecutionEngine {
           sinkIdToObservable(id) = (numPartitions, mutable.ArrayBuffer(context))
           sinkIdToExchangeSource(id) = mutable.HashMap.empty
           var i = 0
-          println("starting " + numPartitions)
           while (i < numPartitions) {
             val rdd = sparkContext.makeRDD(Seq(i), 1)
             rdd.foreachAsync { partitionId =>
@@ -339,7 +307,6 @@ class ClusterExecutionEngine extends ExecutionEngine {
     { case (partitionId, group) =>
       val (host, port) = hostPosts(partitionId)
       val exchangeSink = new ExchangeSink[R](host, port, Subscription {
-        println("Unsubscribe!!!!!!!!")
         //coordinatorRef.send(ShutdownExchangeSource(sinkId))
       })
       exchangeSink(group)
@@ -362,15 +329,12 @@ object Demo {
   }
 
   def apply(): Unit = {
-    MantisJob.source(Sources.socketTextSource("localhost", 9999)).
-      stage(
-        (lines: Observable[String]) => {
-          lines.flatMap { line =>
-            Observable.from(line.split(" "))
-          }
+    MantisJob.
+      source(Sources.socketTextSource("localhost", 9999)).
+      stage((lines: Observable[String]) => {
+          lines.flatMap { line => Observable.from(line.split(" ")) }
         }, 3).
-      stage(
-        (lines: Observable[String]) => {
+      stage((lines: Observable[String]) => {
           lines.groupBy(word => word, _ => 1).flatMap { case (word, counts) =>
             counts.tumbling(10.seconds).flatMap { window =>
               window.sum.timestamp.map { case (time, countInWindow) =>
@@ -380,15 +344,6 @@ object Demo {
           }
         }, 2).
       sink(Sinks.print)
-
-
-    //    wordCounts => {
-    //      wordCounts.map { wordCount =>
-    //        wordCount.map(_._2).tumbling(10.seconds).flatMap { window =>
-//          window.scan(0)(_ + _)
-//        }
-//      }
-//    }
 
     Thread.sleep(1000)
   }
