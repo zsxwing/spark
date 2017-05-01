@@ -160,6 +160,13 @@ class ExecutorClassLoader(
     var inputStream: InputStream = null
     try {
       inputStream = fetchFn(pathInDirectory)
+      if (name.contains("$anonfun$")) {
+        logError("Loading " + name)
+        if (name.contains("anonfun$apply")) {
+          logError("Sleeping for " + name)
+          Thread.sleep(5000)
+        }
+      }
       val bytes = readAndTransformClass(name, inputStream)
       Some(defineClass(name, bytes, 0, bytes.length))
     } catch {
