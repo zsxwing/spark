@@ -22,12 +22,16 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.TopicPartition
+import org.mockito.Matchers
+import org.mockito.Matchers._
+import org.mockito.Mockito._
+import org.scalatest.mockito.MockitoSugar
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.util.Utils
 
-class KafkaRelationSuite extends QueryTest with SharedSQLContext with KafkaTest {
+class KafkaRelationSuite extends QueryTest with SharedSQLContext with KafkaTest with MockitoSugar {
 
   import testImplicits._
 
@@ -103,6 +107,20 @@ class KafkaRelationSuite extends QueryTest with SharedSQLContext with KafkaTest 
     val df = createDF(topic)
     // Test that we default to "earliest" and "latest"
     checkAnswer(df, (0 to 20).map(_.toString).toDF)
+  }
+
+  test("minPartitions") {
+    val topic = newTopic()
+    testUtils.createTopic(topic, partitions = 3)
+    testUtils.sendMessages(topic, (0 to 9).map(_.toString).toArray, Some(0))
+    testUtils.sendMessages(topic, (10 to 19).map(_.toString).toArray, Some(1))
+    testUtils.sendMessages(topic, Array("20"), Some(2))
+
+    // Implicit offset values, should default to earliest and latest
+    val df = createDF(topic, Map("minPartitions" -> "6"))
+    val partitions = df.rdd.collectPartitions()
+    assert(partitions.length >= 6)
+    assert(partitions.flatMap(_.map(_.getString(0))).toSet === (0 to 20).map(_.toString).toSet)
   }
 
   test("explicit offsets") {
@@ -237,6 +255,73 @@ class KafkaRelationSuite extends QueryTest with SharedSQLContext with KafkaTest 
     testBadOptions("assign" -> "")("no topicpartitions to assign")
     testBadOptions("subscribe" -> "")("no topics to subscribe")
     testBadOptions("subscribePattern" -> "")("pattern to subscribe is empty")
+  }
+
+  def mapToKafkaSourceOffset(map: Map[TopicPartition, Long]): KafkaSourceOffset = {
+    KafkaSourceOffset(map)
+  }
+
+  test("resolveAndDivvyUpPartitions - using specific offsets") {
+    val kafkaReader = mock[KafkaOffsetReader]
+    when(kafkaReader.minPartitions).thenReturn(3)
+    val tp = new TopicPartition("topic", 1)
+    val base = Set(KafkaSourceRDDOffsetRange(tp, 1, 4, Some("abc")))
+    when(kafkaReader.fetchSpecificOffsets(Matchers.eq(Map(tp -> 1L)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp -> 1L)))
+    when(kafkaReader.fetchSpecificOffsets(Matchers.eq(Map(tp -> 4L)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp -> 4L)))
+
+    val split = KafkaRelation.resolveAndDivvyUpPartitions(kafkaReader, base)
+    assert(split === Array(
+      KafkaSourceRDDOffsetRange(tp, 1, 2, None),
+      KafkaSourceRDDOffsetRange(tp, 2, 3, None),
+      KafkaSourceRDDOffsetRange(tp, 3, 4, None)))
+  }
+
+  test("resolveAndDivvyUpPartitions - using special offsets") {
+    val kafkaReader = mock[KafkaOffsetReader]
+    when(kafkaReader.minPartitions).thenReturn(3)
+    val tp = new TopicPartition("topic", 1)
+    val base = Set(KafkaSourceRDDOffsetRange(
+      tp, KafkaOffsetRangeLimit.EARLIEST, KafkaOffsetRangeLimit.LATEST, Some("abc")))
+    when(kafkaReader.fetchSpecificOffsets(
+      Matchers.eq(Map(tp -> KafkaOffsetRangeLimit.EARLIEST)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp -> 1L)))
+    when(kafkaReader.fetchSpecificOffsets(Matchers.eq(
+      Map(tp -> KafkaOffsetRangeLimit.LATEST)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp -> 4L)))
+
+    val split = KafkaRelation.resolveAndDivvyUpPartitions(kafkaReader, base)
+    assert(split === Array(
+      KafkaSourceRDDOffsetRange(tp, KafkaOffsetRangeLimit.EARLIEST, 2, None),
+      KafkaSourceRDDOffsetRange(tp, 2, 3, None),
+      KafkaSourceRDDOffsetRange(tp, 3, KafkaOffsetRangeLimit.LATEST, None)))
+  }
+
+  test("resolveAndDivvyUpPartitions - multiple topic partitions") {
+    val kafkaReader = mock[KafkaOffsetReader]
+    when(kafkaReader.minPartitions).thenReturn(3)
+    val tp1 = new TopicPartition("topic", 1)
+    val tp2 = new TopicPartition("topic", 2)
+    import KafkaOffsetRangeLimit.EARLIEST
+    import KafkaOffsetRangeLimit.LATEST
+
+    val base = Set(
+      KafkaSourceRDDOffsetRange(tp1, EARLIEST, LATEST, Some("abc")),
+      KafkaSourceRDDOffsetRange(tp2, EARLIEST, 3, Some("cde")))
+
+    when(kafkaReader.fetchSpecificOffsets(
+      Matchers.eq(Map(tp1 -> EARLIEST, tp2 -> EARLIEST)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp1 -> 1L, tp2 -> 2L)))
+    when(kafkaReader.fetchSpecificOffsets(Matchers.eq(Map(tp1 -> LATEST, tp2 -> 3L)), any()))
+      .thenReturn(mapToKafkaSourceOffset(Map(tp1 -> 100L, tp2 -> 3L)))
+
+    val split = KafkaRelation.resolveAndDivvyUpPartitions(kafkaReader, base)
+    assert(split === Array(
+      KafkaSourceRDDOffsetRange(tp2, EARLIEST, 3, None),
+      KafkaSourceRDDOffsetRange(tp1, EARLIEST, 34, None),
+      KafkaSourceRDDOffsetRange(tp1, 34, 67, None),
+      KafkaSourceRDDOffsetRange(tp1, 67, LATEST, None)))
   }
 
   test("read Kafka transactional messages: read_committed") {

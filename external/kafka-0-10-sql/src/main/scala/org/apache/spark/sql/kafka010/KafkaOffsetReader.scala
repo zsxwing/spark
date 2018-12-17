@@ -93,6 +93,19 @@ private[kafka010] class KafkaOffsetReader(
   private val offsetFetchAttemptIntervalMs =
     readerOptions.getOrElse("fetchOffset.retryIntervalMs", "1000").toLong
 
+  /**
+   * Number of partitions to read from Kafka. If this value is greater than the number of Kafka
+   * topicPartitions, we will not use the CachedConsumer.
+   */
+  val minPartitions: Int = readerOptions.getOrElse("minPartitions", "0").toInt
+
+  /**
+   * Whether we should divide Kafka TopicPartitions with a lot of data into smaller Spark tasks.
+   */
+  def shouldDivvyUpLargePartitions(numTopicPartitions: Int): Boolean = {
+    minPartitions > numTopicPartitions
+  }
+
   private def nextGroupId(): String = {
     groupId = driverGroupIdPrefix + "-" + nextId
     nextId += 1
@@ -334,4 +347,28 @@ private[kafka010] object KafkaOffsetReader {
     StructField("timestamp", TimestampType),
     StructField("timestampType", IntegerType)
   ))
+
+  /** Splits offset ranges with relatively large amount of data to smaller ones. */
+  def divvyUpLargePartitions(
+      offsetRanges: Seq[KafkaSourceRDDOffsetRange],
+      minPartitions: Int): Seq[KafkaSourceRDDOffsetRange] = {
+    val totalSize = offsetRanges.map(o => o.untilOffset - o.fromOffset).sum
+    offsetRanges.flatMap { offsetRange =>
+      val tp = offsetRange.topicPartition
+      val size = offsetRange.untilOffset - offsetRange.fromOffset
+      // number of partitions to divvy up this topic partition to
+      val parts = math.max(math.round(size * 1.0 / totalSize * minPartitions), 1).toInt
+      var remaining = size
+      var startOffset = offsetRange.fromOffset
+      (0 until parts).map { part =>
+        // Fine to do integer division. Last partition will consume all the round off errors
+        val thisPartition = remaining / (parts - part)
+        remaining -= thisPartition
+        val endOffset = startOffset + thisPartition
+        val offsetRange = KafkaSourceRDDOffsetRange(tp, startOffset, endOffset, None)
+        startOffset = endOffset
+        offsetRange
+      }
+    }
+  }
 }

@@ -67,36 +67,41 @@ private[kafka010] class KafkaRelation(
       driverGroupIdPrefix = s"$uniqueGroupId-driver")
 
     // Leverage the KafkaReader to obtain the relevant partition offsets
-    val (fromPartitionOffsets, untilPartitionOffsets) = {
-      try {
-        (getPartitionOffsets(kafkaOffsetReader, startingOffsets),
-          getPartitionOffsets(kafkaOffsetReader, endingOffsets))
-      } finally {
-        kafkaOffsetReader.close()
+    val offsetRanges: Array[KafkaSourceRDDOffsetRange] = try {
+      val fromPartitionOffsets = getPartitionOffsets(kafkaOffsetReader, startingOffsets)
+      val untilPartitionOffsets = getPartitionOffsets(kafkaOffsetReader, endingOffsets)
+
+      // Obtain topicPartitions in both from and until partition offset, ignoring
+      // topic partitions that were added and/or deleted between the two above calls.
+      if (fromPartitionOffsets.keySet != untilPartitionOffsets.keySet) {
+        implicit val topicOrdering: Ordering[TopicPartition] = Ordering.by(t => t.topic())
+        val fromTopics = fromPartitionOffsets.keySet.toList.sorted.mkString(",")
+        val untilTopics = untilPartitionOffsets.keySet.toList.sorted.mkString(",")
+        throw new IllegalStateException("different topic partitions " +
+          s"for starting offsets topics[${fromTopics}] and " +
+          s"ending offsets topics[${untilTopics}]")
       }
-    }
 
-    // Obtain topicPartitions in both from and until partition offset, ignoring
-    // topic partitions that were added and/or deleted between the two above calls.
-    if (fromPartitionOffsets.keySet != untilPartitionOffsets.keySet) {
-      implicit val topicOrdering: Ordering[TopicPartition] = Ordering.by(t => t.topic())
-      val fromTopics = fromPartitionOffsets.keySet.toList.sorted.mkString(",")
-      val untilTopics = untilPartitionOffsets.keySet.toList.sorted.mkString(",")
-      throw new IllegalStateException("different topic partitions " +
-        s"for starting offsets topics[${fromTopics}] and " +
-        s"ending offsets topics[${untilTopics}]")
-    }
-
-    // Calculate offset ranges
-    val offsetRanges = untilPartitionOffsets.keySet.map { tp =>
-      val fromOffset = fromPartitionOffsets.get(tp).getOrElse {
+      // Calculate offset ranges
+      val offsetRangesBase = untilPartitionOffsets.keySet.map { tp =>
+        val fromOffset = fromPartitionOffsets.get(tp).getOrElse {
           // This should not happen since topicPartitions contains all partitions not in
           // fromPartitionOffsets
           throw new IllegalStateException(s"$tp doesn't have a from offset")
+        }
+        val untilOffset = untilPartitionOffsets(tp)
+        KafkaSourceRDDOffsetRange(tp, fromOffset, untilOffset, None)
       }
-      val untilOffset = untilPartitionOffsets(tp)
-      KafkaSourceRDDOffsetRange(tp, fromOffset, untilOffset, None)
-    }.toArray
+
+      if (kafkaOffsetReader.shouldDivvyUpLargePartitions(offsetRangesBase.size)) {
+        KafkaRelation.resolveAndDivvyUpPartitions(kafkaOffsetReader, offsetRangesBase)
+      } else {
+        offsetRangesBase.toArray
+      }
+
+    } finally {
+      kafkaOffsetReader.close()
+    }
 
     logInfo("GetBatch generating RDD of offset range: " +
       offsetRanges.sortBy(_.topicPartition.toString).mkString(", "))
@@ -147,4 +152,49 @@ private[kafka010] class KafkaRelation(
 
   override def toString: String =
     s"KafkaRelation(strategy=$strategy, start=$startingOffsets, end=$endingOffsets)"
+}
+
+private[kafka010] object KafkaRelation {
+
+  /**
+   * Since offsets can be early and late binding which are evaluated on the executors, in
+   * order to divvy up the partitions we need to perform some substitutions. We don't want
+   * to send exact offsets to the executors, because data may age out before we can consume
+   * the data. This method makes some approximate splitting, and replaces the special offset values
+   * in the final output.
+   */
+  def resolveAndDivvyUpPartitions(
+      kafkaReader: KafkaOffsetReader,
+      offsetRangesBase: Set[KafkaSourceRDDOffsetRange]): Array[KafkaSourceRDDOffsetRange] = {
+    val fromOffsetsMap =
+      offsetRangesBase.map(range => (range.topicPartition, range.fromOffset)).toMap
+    val untilOffsetsMap =
+      offsetRangesBase.map(range => (range.topicPartition, range.untilOffset)).toMap
+
+    // No need to report data loss here
+    val resolvedFromOffsets =
+      kafkaReader.fetchSpecificOffsets(fromOffsetsMap, _ => ()).partitionToOffsets
+    val resolvedUntilOffsets =
+      kafkaReader.fetchSpecificOffsets(untilOffsetsMap, _ => ()).partitionToOffsets
+
+    val substitutedRanges = offsetRangesBase.map { range =>
+      val tp = range.topicPartition
+      range.copy(fromOffset = resolvedFromOffsets(tp), untilOffset = resolvedUntilOffsets(tp))
+    }
+
+    // now we need to replace possible earliest and latest offsets
+    val divvied = KafkaOffsetReader.divvyUpLargePartitions(substitutedRanges.toSeq,
+      kafkaReader.minPartitions).groupBy(_.topicPartition)
+
+    divvied.flatMap { case (tp, splitOffsetRanges) =>
+      if (splitOffsetRanges.length == 1) {
+        Seq(KafkaSourceRDDOffsetRange(tp, fromOffsetsMap(tp), untilOffsetsMap(tp), None))
+      } else {
+        // the list can't be empty
+        val first = splitOffsetRanges.head.copy(fromOffset = fromOffsetsMap(tp))
+        val end = splitOffsetRanges.last.copy(untilOffset = untilOffsetsMap(tp))
+        Seq(first) ++ splitOffsetRanges.drop(1).dropRight(1) :+ end
+      }
+    }.toArray
+  }
 }
